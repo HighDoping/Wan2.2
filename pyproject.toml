@@ -8,6 +8,7 @@ version = "2.2.0"
 description = "Wan: Open and Advanced Large-Scale Video Generative Models"
 authors = [
     { name = "Wan Team", email = "wan.ai@alibabacloud.com" }
+    
 ]
 license = { file = "LICENSE.txt" }
 readme = "README.md"
@@ -26,7 +27,6 @@ dependencies = [
     "ftfy",
     "dashscope",
     "imageio-ffmpeg",
-    "flash_attn",
     "numpy>=1.23.5,<2"
 ]
 
@@ -37,7 +37,8 @@ dev = [
     "flake8",
     "isort",
     "mypy",
-    "huggingface-hub[cli]"
+    "huggingface-hub[cli]",
+    "modelscope"
 ]
 
 [project.urls]

@@ -1,8 +1,9 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import gc
 import logging
 
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -12,6 +13,26 @@ __all__ = [
 ]
 
 CACHE_T = 2
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
+
+
+device = get_device()
+
+
+def clear_cache():
+    gc.collect()
+    if torch.backends.mps.is_built():
+        torch.mps.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 class CausalConv3d(nn.Conv3d):
@@ -567,6 +588,115 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
+    def blend_v(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
+        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (
+                1 - y / blend_extent
+            ) + b[:, :, :, y, :] * (y / blend_extent)
+        return b
+
+    def blend_h(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
+        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (
+                1 - x / blend_extent
+            ) + b[:, :, :, :, x] * (x / blend_extent)
+        return b
+
+    def spatial_tiled_decode(self, z, scale, tile_size):
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = int(tile_sample_min_size / 8)
+        tile_overlap_factor = 0.25
+
+        # z: [b,c,t,h,w]
+
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1
+            )
+        else:
+            z = z / scale[1] + scale[0]
+
+        overlap_size = int(tile_latent_min_size * (1 - tile_overlap_factor))  # 8 0.75
+        blend_extent = int(tile_sample_min_size * tile_overlap_factor)  # 256 0.25
+        row_limit = tile_sample_min_size - blend_extent
+
+        # Split z into overlapping tiles and decode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
+        rows = []
+        for i in range(0, z.shape[-2], overlap_size):
+            row = []
+            for j in range(0, z.shape[-1], overlap_size):
+                tile = z[
+                    :, :, :, i : i + tile_latent_min_size, j : j + tile_latent_min_size
+                ]
+                decoded = self.decode(tile)
+                row.append(decoded)
+            rows.append(row)
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        return torch.cat(result_rows, dim=-2)
+
+    def spatial_tiled_encode(self, x, scale, tile_size):
+        tile_sample_min_size = tile_size
+        tile_latent_min_size = int(tile_sample_min_size / 8)
+        tile_overlap_factor = 0.25
+
+        overlap_size = int(tile_sample_min_size * (1 - tile_overlap_factor))
+        blend_extent = int(tile_latent_min_size * tile_overlap_factor)
+        row_limit = tile_latent_min_size - blend_extent
+
+        # Split video into tiles and encode them separately.
+        rows = []
+        for i in range(0, x.shape[-2], overlap_size):
+            row = []
+            for j in range(0, x.shape[-1], overlap_size):
+                tile = x[
+                    :, :, :, i : i + tile_sample_min_size, j : j + tile_sample_min_size
+                ]
+                tile = self.encode(tile)
+                row.append(tile)
+            rows.append(row)
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_extent)
+                result_row.append(tile[:, :, :, :row_limit, :row_limit])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        mu = torch.cat(result_rows, dim=-2)
+
+        if isinstance(scale[0], torch.Tensor):
+            mu = (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(
+                1, self.z_dim, 1, 1, 1
+            )
+        else:
+            mu = (mu - scale[0]) * scale[1]
+
+        return mu
+
     def reparameterize(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
@@ -583,10 +713,11 @@ class WanVAE_(nn.Module):
         self._conv_num = count_conv3d(self.decoder)
         self._conv_idx = [0]
         self._feat_map = [None] * self._conv_num
-        #cache encode
+        # cache encode
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
+        clear_cache()
 
 
 def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
@@ -618,13 +749,21 @@ def _video_vae(pretrained_path=None, z_dim=None, device='cpu', **kwargs):
 
 class Wan2_1_VAE:
 
-    def __init__(self,
-                 z_dim=16,
-                 vae_pth='cache/vae_step_411000.pth',
-                 dtype=torch.float,
-                 device="cuda"):
+    def __init__(
+        self,
+        z_dim=16,
+        vae_pth="cache/vae_step_411000.pth",
+        dtype=torch.float,
+        device="mps",
+        tile_size=None,
+    ):
         self.dtype = dtype
         self.device = device
+
+        if tile_size is None:
+            self.tile_size = 0
+        else:
+            self.tile_size = tile_size
 
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
@@ -648,16 +787,39 @@ class Wan2_1_VAE:
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
-        with amp.autocast(dtype=self.dtype):
-            return [
-                self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
-                for u in videos
-            ]
+        with amp.autocast(device_type=device, dtype=self.dtype):
+            if self.tile_size > 0:
+                return [
+                    self.model.spatial_tiled_encode(
+                        u.unsqueeze(0), self.scale, self.tile_size
+                    )
+                    .float()
+                    .squeeze(0)
+                    for u in videos
+                ]
+            else:
+                return [
+                    self.model.encode(u.unsqueeze(0), self.scale).float().squeeze(0)
+                    for u in videos
+                ]
 
     def decode(self, zs):
-        with amp.autocast(dtype=self.dtype):
-            return [
-                self.model.decode(u.unsqueeze(0),
-                                  self.scale).float().clamp_(-1, 1).squeeze(0)
-                for u in zs
-            ]
+        with amp.autocast(device_type=device, dtype=self.dtype):
+            if self.tile_size > 0:
+                return [
+                    self.model.spatial_tiled_decode(
+                        u.unsqueeze(0), self.scale, self.tile_size
+                    )
+                    .float()
+                    .clamp_(-1, 1)
+                    .squeeze(0)
+                    for u in zs
+                ]
+            else:
+                return [
+                    self.model.decode(u.unsqueeze(0), self.scale)
+                    .float()
+                    .clamp_(-1, 1)
+                    .squeeze(0)
+                    for u in zs
+                ]

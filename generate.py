@@ -92,10 +92,13 @@ def _parse_args():
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
+        "--tile_size", type=int, default=None, help="The tile size for VAE in T2V task."
+    )
+    parser.add_argument(
         "--frame_num",
         type=int,
         default=None,
-        help="How many frames of video are generated. The number should be 4n+1"
+        help="How many frames of video are generated. The number should be 4n+1",
     )
     parser.add_argument(
         "--ckpt_dir",
@@ -124,10 +127,17 @@ def _parse_args():
         default=False,
         help="Whether to place T5 model on CPU.")
     parser.add_argument(
+        "--t5_quant",
+        action="store_true",
+        default=False,
+        help="Whether to use quantized T5 model.",
+    )
+    parser.add_argument(
         "--dit_fsdp",
         action="store_true",
         default=False,
-        help="Whether to use FSDP for DiT.")
+        help="Whether to use FSDP for DiT.",
+    )
     parser.add_argument(
         "--save_file",
         type=str,
@@ -193,6 +203,24 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether to convert model paramerters dtype.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use for computation (mps, cpu).",
+    )
+    parser.add_argument(
+        "--disk_offload",
+        action="store_true",
+        default=False,
+        help="Whether to offload the model to disk.",
+    )
+    parser.add_argument(
+        "--mps_ram",
+        type=str,
+        default=None,
+        help="The MPS RAM to use for loading. Eg. 8GB",
+    )
 
     args = parser.parse_args()
 
@@ -214,14 +242,34 @@ def _init_logging(rank):
 
 
 def generate(args):
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
-    _init_logging(rank)
+    if "RANK" in os.environ:
+        # Distributed setup
+        rank = int(os.getenv("RANK", 0))
+        world_size = int(os.getenv("WORLD_SIZE", 1))
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        device = torch.device(
+            f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        )
+        _init_logging(rank)
+    else:
+        # Single-device setup with MPS fallback
+        rank = 0
+        world_size = 1
+        if args.device:
+            device = torch.device(args.device)
+        else:
+            device = torch.device(
+                "cuda:0"
+                if torch.cuda.is_available()
+                else "mps" if torch.backends.mps.is_available() else "cpu"
+            )
+        _init_logging(rank)
+
+    # Ensure all torch operations use this device
+    torch.set_default_device(device)
 
     if args.offload_model is None:
-        args.offload_model = False if world_size > 1 else True
+        args.offload_model = True
         logging.info(
             f"offload_model is not specified, set to {args.offload_model}.")
     if world_size > 1:
@@ -307,12 +355,16 @@ def generate(args):
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
+            rank=0,
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_sp=False,
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            t5_quant=args.t5_quant,
+            vae_tile_size=args.tile_size,
+            disk_offload=args.disk_offload,
+            mps_ram=args.mps_ram,
         )
 
         logging.info(f"Generating video ...")
@@ -333,11 +385,15 @@ def generate(args):
             checkpoint_dir=args.ckpt_dir,
             device_id=device,
             rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_sp=(args.ulysses_size > 1),
+            t5_fsdp=False,
+            dit_fsdp=False,
+            use_sp=False,
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            t5_quant=args.t5_quant,
+            vae_tile_size=args.tile_size,
+            disk_offload=args.disk_offload,
+            mps_ram=args.mps_ram,
         )
 
         logging.info(f"Generating video ...")
@@ -365,6 +421,10 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
+            t5_quant=args.t5_quant,
+            vae_tile_size=args.tile_size,
+            disk_offload=args.disk_offload,
+            mps_ram=args.mps_ram,
         )
 
         logging.info("Generating video ...")
@@ -397,8 +457,8 @@ def generate(args):
             normalize=True,
             value_range=(-1, 1))
     del video
-
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

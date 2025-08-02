@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from functools import partial
 
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -20,7 +20,6 @@ from .distributed.fsdp import shard_model
 from .distributed.sequence_parallel import sp_attn_forward, sp_dit_forward
 from .distributed.util import get_world_size
 from .modules.model import WanModel
-from .modules.t5 import T5EncoderModel
 from .modules.vae2_2 import Wan2_2_VAE
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
@@ -29,6 +28,14 @@ from .utils.fm_solvers import (
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .utils.utils import best_output_size, masks_like
+
+
+def clear_cache():
+    gc.collect()
+    if torch.backends.mps.is_built():
+        torch.mps.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 class WanTI2V:
@@ -43,7 +50,10 @@ class WanTI2V:
         dit_fsdp=False,
         use_sp=False,
         t5_cpu=False,
-        init_on_cpu=True,
+        t5_quant=False,
+        vae_tile_size=None,
+        disk_offload=False,
+        mps_ram="10GB",
         convert_model_dtype=False,
     ):
         r"""
@@ -72,51 +82,41 @@ class WanTI2V:
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
         """
-        self.device = torch.device(f"cuda:{device_id}")
+        if isinstance(device_id, torch.device):
+            self.device = device_id
+        elif device_id == "mps" or (isinstance(device_id, int) and device_id == -1):
+            self.device = torch.device(
+                "mps" if torch.backends.mps.is_available() else "cpu"
+            )
+        else:
+            self.device = torch.device(f"cuda:{device_id}")
+
         self.config = config
+        self.checkpoint_dir = checkpoint_dir
+        self.device_id = device_id
         self.rank = rank
         self.t5_cpu = t5_cpu
-        self.init_on_cpu = init_on_cpu
+        self.t5_fsdp = t5_fsdp
+        self.convert_model_dtype = convert_model_dtype
+
+        self.t5_quant = t5_quant
+        self.vae_tile_size = vae_tile_size
+        self.disk_offload = disk_offload
+        self.mps_ram = mps_ram
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
 
-        if t5_fsdp or dit_fsdp or use_sp:
-            self.init_on_cpu = False
-
-        shard_fn = partial(shard_model, device_id=device_id)
-        self.text_encoder = T5EncoderModel(
-            text_len=config.text_len,
-            dtype=config.t5_dtype,
-            device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
-            shard_fn=shard_fn if t5_fsdp else None)
-
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
-        self.vae = Wan2_2_VAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
-        self.model = self._configure_model(
-            model=self.model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
 
-        if use_sp:
-            self.sp_size = get_world_size()
-        else:
-            self.sp_size = 1
+        self.sp_size = 1
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
-    def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
-                         convert_model_dtype):
+    def _configure_model(self, model):
         """
         Configures a model object. This includes setting evaluation modes,
         applying distributed parallel strategy, and handling device placement.
@@ -124,12 +124,6 @@ class WanTI2V:
         Args:
             model (torch.nn.Module):
                 The model instance to configure.
-            use_sp (`bool`):
-                Enable distribution strategy of sequence parallel.
-            dit_fsdp (`bool`):
-                Enable FSDP sharding for DiT model.
-            shard_fn (callable):
-                The function to apply FSDP sharding.
             convert_model_dtype (`bool`):
                 Convert DiT model parameters dtype to 'config.param_dtype'.
                 Only works without FSDP.
@@ -140,22 +134,8 @@ class WanTI2V:
         """
         model.eval().requires_grad_(False)
 
-        if use_sp:
-            for block in model.blocks:
-                block.self_attn.forward = types.MethodType(
-                    sp_attn_forward, block.self_attn)
-            model.forward = types.MethodType(sp_dit_forward, model)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        if dit_fsdp:
-            model = shard_fn(model)
-        else:
-            if convert_model_dtype:
-                model.to(self.param_dtype)
-            if not self.init_on_cpu:
-                model.to(self.device)
+        if self.convert_model_dtype:
+            model.to(self.param_dtype)
 
         return model
 
@@ -282,9 +262,13 @@ class WanTI2V:
         """
         # preprocess
         F = frame_num
-        target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
-                        size[1] // self.vae_stride[1],
-                        size[0] // self.vae_stride[2])
+        vae_model_z_dim = 48
+        target_shape = (
+            vae_model_z_dim,
+            (F - 1) // self.vae_stride[0] + 1,
+            size[1] // self.vae_stride[1],
+            size[0] // self.vae_stride[2],
+        )
 
         seq_len = math.ceil((target_shape[2] * target_shape[3]) /
                             (self.patch_size[1] * self.patch_size[2]) *
@@ -296,17 +280,67 @@ class WanTI2V:
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
 
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
+        logging.info("Loading text encoder model.")
+        if self.t5_quant:
+            from .modules.t5_gguf import run_llama_embedding
+
+            checkpoint_path = os.path.join(
+                self.checkpoint_dir, self.config.t5_quant_checkpoint
+            )
+            context = [
+                torch.from_numpy(run_llama_embedding(checkpoint_path, input_prompt)).to(
+                    self.device
+                )
+            ]
+            context_null = [
+                torch.from_numpy(run_llama_embedding(checkpoint_path, n_prompt)).to(
+                    self.device
+                )
+            ]
         else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            from .modules.t5 import T5EncoderModel
+
+            self.text_encoder = T5EncoderModel(
+                text_len=self.config.text_len,
+                dtype=self.config.t5_dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=os.path.join(
+                    self.checkpoint_dir, self.config.t5_checkpoint
+                ),
+                tokenizer_path=os.path.join(
+                    self.checkpoint_dir, self.config.t5_tokenizer
+                ),
+                shard_fn=None,
+            )
+
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+            else:
+                context = self.text_encoder([input_prompt], torch.device("cpu"))
+                context_null = self.text_encoder([n_prompt], torch.device("cpu"))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+            if offload_model:
+                del self.text_encoder
+                logging.info("Remove text encoder model.")
+                clear_cache()
+
+        logging.info("Loading WanModel")
+        if self.disk_offload:
+            logging.info("Use disk offload.")
+            self.model = WanModel.from_pretrained(
+                self.checkpoint_dir,
+                device_map="auto",
+                max_memory={"mps": self.mps_ram, "cpu": "0.5GB"},
+                offload_folder="disk_offload",
+                offload_state_dict=True,
+            )
+        else:
+            self.model = WanModel.from_pretrained(self.checkpoint_dir)
+            self.model.to(self.device)
+        self.model = self._configure_model(self.model)
 
         noise = [
             torch.randn(
@@ -316,7 +350,8 @@ class WanTI2V:
                 target_shape[3],
                 dtype=torch.float32,
                 device=self.device,
-                generator=seed_g)
+                generator=seed_g,
+            )
         ]
 
         @contextmanager
@@ -327,9 +362,11 @@ class WanTI2V:
 
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
-                no_sync(),
+            amp.autocast(  # type: ignore
+                device_type=str(self.device), dtype=self.param_dtype
+            ),
+            torch.no_grad(),
+            no_sync(),
         ):
 
             if sample_solver == 'unipc':
@@ -360,10 +397,9 @@ class WanTI2V:
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
-            if offload_model or self.init_on_cpu:
-                self.model.to(self.device)
-                torch.cuda.empty_cache()
-
+            if offload_model:
+                clear_cache()
+            logging.info("Start generation loop.")
             for _, t in enumerate(tqdm(timesteps)):
                 latent_model_input = latents
                 timestep = [t]
@@ -392,22 +428,34 @@ class WanTI2V:
                     return_dict=False,
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
+                del noise_pred, noise_pred_cond, noise_pred_uncond, temp_x0
+                if offload_model:
+                    clear_cache()
+            logging.info("End generation loop.")
             x0 = latents
             if offload_model:
-                self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                del self.model
+                logging.info("Remove WanModel.")
+                clear_cache()
             if self.rank == 0:
+                logging.info("Loading VAE model.")
+                self.vae = Wan2_2_VAE(
+                    vae_pth=os.path.join(
+                        self.checkpoint_dir, self.config.vae_checkpoint
+                    ),
+                    device=self.device,
+                    tile_size=self.vae_tile_size,
+                )
+                logging.info("Decoding video frames.")
                 videos = self.vae.decode(x0)
 
         del noise, latents
         del sample_scheduler
         if offload_model:
-            gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
-
+            del self.vae
+            clear_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         return videos[0] if self.rank == 0 else None
 
     def i2v(self,
@@ -485,43 +533,106 @@ class WanTI2V:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+
+        vae_model_z_dim = 48
         noise = torch.randn(
-            self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
+            vae_model_z_dim,
+            (F - 1) // self.vae_stride[0] + 1,
             oh // self.vae_stride[1],
             ow // self.vae_stride[2],
             dtype=torch.float32,
             generator=seed_g,
-            device=self.device)
+            device=self.device,
+        )
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
         # preprocess
-        if not self.t5_cpu:
-            self.text_encoder.model.to(self.device)
-            context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
-            if offload_model:
-                self.text_encoder.model.cpu()
-        else:
-            context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
-            context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+        logging.info("Loading text encoder model.")
+        if self.t5_quant:
+            from .modules.t5_gguf import run_llama_embedding
 
+            checkpoint_path = os.path.join(
+                self.checkpoint_dir, self.config.t5_quant_checkpoint
+            )
+            context = [
+                torch.from_numpy(run_llama_embedding(checkpoint_path, input_prompt)).to(
+                    self.device
+                )
+            ]
+            context_null = [
+                torch.from_numpy(run_llama_embedding(checkpoint_path, n_prompt)).to(
+                    self.device
+                )
+            ]
+        else:
+            from .modules.t5 import T5EncoderModel
+
+            self.text_encoder = T5EncoderModel(
+                text_len=self.config.text_len,
+                dtype=self.config.t5_dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=os.path.join(
+                    self.checkpoint_dir, self.config.t5_checkpoint
+                ),
+                tokenizer_path=os.path.join(
+                    self.checkpoint_dir, self.config.t5_tokenizer
+                ),
+                shard_fn=None,
+            )
+
+            if not self.t5_cpu:
+                self.text_encoder.model.to(self.device)
+                context = self.text_encoder([input_prompt], self.device)
+                context_null = self.text_encoder([n_prompt], self.device)
+            else:
+                context = self.text_encoder([input_prompt], torch.device("cpu"))
+                context_null = self.text_encoder([n_prompt], torch.device("cpu"))
+                context = [t.to(self.device) for t in context]
+                context_null = [t.to(self.device) for t in context_null]
+            if offload_model:
+                del self.text_encoder
+                logging.info("Remove text encoder model.")
+                clear_cache()
+
+        logging.info("Loading VAE model.")
+        self.vae = Wan2_2_VAE(
+            vae_pth=os.path.join(self.checkpoint_dir, self.config.vae_checkpoint),
+            device=self.device,
+            tile_size=self.vae_tile_size,
+        )
+        logging.info("Encoding input image.")
         z = self.vae.encode([img])
+        if offload_model:
+            del img, self.vae
+            clear_cache()
 
         @contextmanager
         def noop_no_sync():
             yield
 
-        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+        logging.info("Loading WanModel")
+        if self.disk_offload:
+            logging.info("Use disk offload.")
+            self.model = WanModel.from_pretrained(
+                self.checkpoint_dir,
+                device_map="auto",
+                max_memory={"mps": self.mps_ram, "cpu": "0.5GB"},
+                offload_folder="disk_offload",
+                offload_state_dict=True,
+            )
+        else:
+            self.model = WanModel.from_pretrained(self.checkpoint_dir)
+            self.model.to(self.device)
+        self.model = self._configure_model(self.model)
 
+        no_sync = getattr(self.model, "no_sync", noop_no_sync)
         # evaluation mode
         with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
-                no_sync(),
+            amp.autocast(device_type=str(self.device), dtype=self.param_dtype),
+            torch.no_grad(),
+            no_sync(),
         ):
 
             if sample_solver == 'unipc':
@@ -560,15 +671,16 @@ class WanTI2V:
                 'seq_len': seq_len,
             }
 
-            if offload_model or self.init_on_cpu:
-                self.model.to(self.device)
-                torch.cuda.empty_cache()
+            if offload_model:
+                clear_cache()
+
+            logging.info("Start generation loop.")
 
             for _, t in enumerate(tqdm(timesteps)):
-                latent_model_input = [latent.to(self.device)]
+                latent_model_input = [latent]
                 timestep = [t]
 
-                timestep = torch.stack(timestep).to(self.device)
+                timestep = torch.stack(timestep)
 
                 temp_ts = (mask2[0][0][:, ::2, ::2] * timestep).flatten()
                 temp_ts = torch.cat([
@@ -577,14 +689,10 @@ class WanTI2V:
                 ])
                 timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = self.model(
-                    latent_model_input, t=timestep, **arg_c)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
+                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0]
                 noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
+                    latent_model_input, t=timestep, **arg_null
+                )[0]
                 noise_pred = noise_pred_uncond + guide_scale * (
                     noise_pred_cond - noise_pred_uncond)
 
@@ -598,22 +706,40 @@ class WanTI2V:
                 latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
 
                 x0 = [latent]
-                del latent_model_input, timestep
+                del (
+                    latent_model_input,
+                    timestep,
+                    noise_pred,
+                    noise_pred_cond,
+                    noise_pred_uncond,
+                    temp_x0,
+                )
+
+            logging.info("End generation loop.")
 
             if offload_model:
-                self.model.cpu()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                del self.model
+                logging.info("Remove WanModel.")
+                clear_cache()
 
             if self.rank == 0:
+                logging.info("Loading VAE model.")
+                self.vae = Wan2_2_VAE(
+                    vae_pth=os.path.join(
+                        self.checkpoint_dir, self.config.vae_checkpoint
+                    ),
+                    device=self.device,
+                    tile_size=self.vae_tile_size,
+                )
+                logging.info("Decoding video frames.")
                 videos = self.vae.decode(x0)
 
         del noise, latent, x0
         del sample_scheduler
         if offload_model:
-            gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
+            del self.vae
+            clear_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
         return videos[0] if self.rank == 0 else None

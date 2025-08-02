@@ -49,9 +49,27 @@ def flash_attention(
     deterministic:  bool. If True, slightly slower and uses more memory.
     dtype:          torch.dtype. Apply when dtype of q/k/v is not float16/bfloat16.
     """
-    half_dtypes = (torch.float16, torch.bfloat16)
+    half_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert q.size(-1) <= 256
+    
+    # Add CPU/MPS fallback implementation
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE) or q.device.type in [
+        "cpu",
+        "mps",
+    ]:
+        # Implement standard attention for CPU/MPS
+        return attention(
+            q,
+            k,
+            v,
+            q_lens=q_lens,
+            k_lens=k_lens,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+        )
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
