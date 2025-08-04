@@ -704,7 +704,7 @@ class Decoder3d(nn.Module):
                     dim=2,
                 )
             x = self.conv1(x, feat_cache[idx])
-            feat_cache[idx] = cache_x
+            # feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
             x = self.conv1(x)
@@ -1024,7 +1024,7 @@ class Wan2_2_VAE:
         vae_pth=None,
         dim_mult=[1, 2, 4, 4],
         temperal_downsample=[False, True, True],
-        dtype=torch.float,
+        dtype=torch.bfloat16,
         device="mps",
         tile_size=None,
     ):
@@ -1155,7 +1155,13 @@ class Wan2_2_VAE:
                 dim=c_dim,
                 dim_mult=dim_mult,
                 temperal_downsample=temperal_downsample,
-            ).eval().requires_grad_(False).to(device))
+                device=device
+            )
+            .to(self.dtype)
+            .eval()
+            .requires_grad_(False)
+            # .to(device)
+        )
 
     def encode(self, videos):
         try:

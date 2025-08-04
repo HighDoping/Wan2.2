@@ -105,7 +105,11 @@ class WanTI2V:
         self.mps_ram = mps_ram
 
         self.num_train_timesteps = config.num_train_timesteps
-        self.param_dtype = config.param_dtype
+
+        if self.convert_model_dtype:
+            self.param_dtype = config.param_dtype
+        else:
+            self.param_dtype = torch.float32
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size
@@ -336,9 +340,12 @@ class WanTI2V:
                 max_memory={"mps": self.mps_ram, "cpu": "0.5GB"},
                 offload_folder="disk_offload",
                 offload_state_dict=True,
+                torch_dtype=self.param_dtype,
             )
         else:
-            self.model = WanModel.from_pretrained(self.checkpoint_dir)
+            self.model = WanModel.from_pretrained(
+                self.checkpoint_dir, torch_dtype=self.param_dtype
+            )
             self.model.to(self.device)
         self.model = self._configure_model(self.model)
 
@@ -348,7 +355,7 @@ class WanTI2V:
                 target_shape[1],
                 target_shape[2],
                 target_shape[3],
-                dtype=torch.float32,
+                dtype=self.param_dtype,
                 device=self.device,
                 generator=seed_g,
             )
@@ -433,26 +440,23 @@ class WanTI2V:
                     clear_cache()
             logging.info("End generation loop.")
             x0 = latents
+
             if offload_model:
-                del self.model
+                del self.model, noise, latents, sample_scheduler
                 logging.info("Remove WanModel.")
                 clear_cache()
-            if self.rank == 0:
-                logging.info("Loading VAE model.")
-                self.vae = Wan2_2_VAE(
-                    vae_pth=os.path.join(
-                        self.checkpoint_dir, self.config.vae_checkpoint
-                    ),
-                    device=self.device,
-                    tile_size=self.vae_tile_size,
-                )
-                logging.info("Decoding video frames.")
-                videos = self.vae.decode(x0)
+        if self.rank == 0:
+            logging.info("Loading VAE model.")
+            self.vae = Wan2_2_VAE(
+                vae_pth=os.path.join(self.checkpoint_dir, self.config.vae_checkpoint),
+                device=self.device,
+                tile_size=self.vae_tile_size,
+            )
+            logging.info("Decoding video frames.")
+            videos = self.vae.decode(x0)
 
-        del noise, latents
-        del sample_scheduler
         if offload_model:
-            del self.vae
+            del self.vae, x0
             clear_cache()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -540,7 +544,7 @@ class WanTI2V:
             (F - 1) // self.vae_stride[0] + 1,
             oh // self.vae_stride[1],
             ow // self.vae_stride[2],
-            dtype=torch.float32,
+            dtype=self.param_dtype,
             generator=seed_g,
             device=self.device,
         )
@@ -621,9 +625,12 @@ class WanTI2V:
                 max_memory={"mps": self.mps_ram, "cpu": "0.5GB"},
                 offload_folder="disk_offload",
                 offload_state_dict=True,
+                torch_dtype=self.param_dtype,
             )
         else:
-            self.model = WanModel.from_pretrained(self.checkpoint_dir)
+            self.model = WanModel.from_pretrained(
+                self.checkpoint_dir, torch_dtype=self.param_dtype
+            )
             self.model.to(self.device)
         self.model = self._configure_model(self.model)
 
@@ -718,7 +725,7 @@ class WanTI2V:
             logging.info("End generation loop.")
 
             if offload_model:
-                del self.model
+                del self.model, noise, latent, sample_scheduler
                 logging.info("Remove WanModel.")
                 clear_cache()
 
@@ -734,10 +741,8 @@ class WanTI2V:
                 logging.info("Decoding video frames.")
                 videos = self.vae.decode(x0)
 
-        del noise, latent, x0
-        del sample_scheduler
         if offload_model:
-            del self.vae
+            del self.vae, x0
             clear_cache()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()

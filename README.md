@@ -15,17 +15,16 @@ The original repo also loads all models at startup, which takes a lot of memory.
 - Load models only when needed. (T5, base model, and vae)
 - Modify the offload_model method to delete the model from memory immediately after use.
 - Add quantized T5 model to reduce memory usage.
+- Use bf16 precision to reduce memory usage.
 
 ## Problems
 
-- Mixed precision is broken now.
 - VAE tiling for VAE2.2 is broken now.
 
 ## TODO
 
 - Fix VAE tiling for VAE2.2.
 - Add support for A14B model.
-- Try fix mixed precision.
 
 ## Installation
 
@@ -73,16 +72,18 @@ brew install llama.cpp
 
 ## Usage
 
-### Wan2.2-TI2V-5B (broken now)
+### Wan2.2-TI2V-5B
 
 To generate a video, use the following command:
 
 ```bash
 export PYTORCH_ENABLE_MPS_FALLBACK=1
-python generate.py --task ti2v-5B --size "1280*704" --frame_num 9 --ckpt_dir ./Wan2.2-TI2V-5B --offload_model True --tile_size 128 --t5_quant --device mps --prompt "Penguins fighting a polar bear in the arctic." --save_file output_video.mp4
+python generate.py --task ti2v-5B --size "1280*704" --frame_num 41 --ckpt_dir ./Wan2.2-TI2V-5B --offload_model True --convert_model_dtype --t5_quant --device mps --prompt "Penguins fighting a polar bear in the arctic." --save_file output_video.mp4
 ```
 
 ```--t5_quant``` enables the quantized T5 model.
+
+For 32GB M4 Mac Mini, time taken: 1h37m. Result: [TI2V-5B](./assets/TI2V.mp4)
 
 ### How to choose the parameters
 

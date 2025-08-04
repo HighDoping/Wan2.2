@@ -22,6 +22,7 @@ def get_device():
 
 
 amp_device = get_device()
+amp_dtype= torch.bfloat16
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -248,16 +249,16 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(device_type=amp_device, dtype=torch.float32):
+        # assert e.dtype == torch.float32
+        with amp.autocast(device_type=amp_device, dtype=amp_dtype):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
-        assert e[0].dtype == torch.float32
+        # assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
             seq_lens, grid_sizes, freqs)
-        with amp.autocast(device_type=amp_device, dtype=torch.float32):
+        with amp.autocast(device_type=amp_device, dtype=amp_dtype):
             x = x + y * e[2].squeeze(2)
 
         # cross-attention & ffn function
@@ -265,7 +266,7 @@ class WanAttentionBlock(nn.Module):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
                 self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
-            with amp.autocast(device_type=amp_device, dtype=torch.float32):
+            with amp.autocast(device_type=amp_device, dtype=amp_dtype):
                 x = x + y * e[5].squeeze(2)
             return x
 
@@ -296,8 +297,8 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(device_type=amp_device, dtype=torch.float32):
+        # assert e.dtype == torch.float32
+        with amp.autocast(device_type=amp_device, dtype=amp_dtype):
             e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
             x = (
                 self.head(
@@ -473,14 +474,14 @@ class WanModel(ModelMixin, ConfigMixin):
         # time embeddings
         if t.dim() == 1:
             t = t.expand(t.size(0), seq_len)
-        with amp.autocast(device_type=amp_device, dtype=torch.float32):
+        with amp.autocast(device_type=amp_device, dtype=amp_dtype):
             bt = t.size(0)
             t = t.flatten()
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim,
                                         t).unflatten(0, (bt, seq_len)).float())
             e0 = self.time_projection(e).unflatten(2, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None
