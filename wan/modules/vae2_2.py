@@ -704,7 +704,7 @@ class Decoder3d(nn.Module):
                     dim=2,
                 )
             x = self.conv1(x, feat_cache[idx])
-            # feat_cache[idx] = cache_x
+            feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
             x = self.conv1(x)

@@ -72,7 +72,7 @@ brew install llama.cpp
 
 ## Usage
 
-### Wan2.2-TI2V-5B
+### Text to video with Wan2.2-TI2V-5B
 
 To generate a video, use the following command:
 
@@ -83,7 +83,16 @@ python generate.py --task ti2v-5B --size "1280*704" --frame_num 41 --ckpt_dir ./
 
 ```--t5_quant``` enables the quantized T5 model.
 
-For 32GB M4 Mac Mini, time taken: 1h37m. Result: [TI2V-5B](./assets/TI2V.mp4)
+For 32GB M4 Mac Mini, time taken: 1h37m. Result: [TI2V_T2V](./assets/TI2V_T2V.mp4)
+
+### Image to video with Wan2.2-TI2V-5B
+
+```bash
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+python generate.py --task ti2v-5B --size "1280*704" --frame_num 25 --ckpt_dir ./Wan2.2-TI2V-5B --offload_model True --convert_model_dtype --t5_quant --device mps --image examples/i2v_input.JPG --prompt "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. The fluffy-furred feline gazes directly at the camera with a relaxed expression. Blurred beach scenery forms the background featuring crystal-clear waters, distant green hills, and a blue sky dotted with white clouds. The cat assumes a naturally relaxed posture, as if savoring the sea breeze and warm sunlight. A close-up shot highlights the feline's intricate details and the refreshing atmosphere of the seaside."
+```
+
+For 32GB M4 Mac Mini, time taken: 47m. Result: [TI2V_I2V](./assets/TI2V_I2V.mp4)
 
 ### How to choose the parameters
 

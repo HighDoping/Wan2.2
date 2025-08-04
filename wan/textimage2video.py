@@ -526,7 +526,7 @@ class WanTI2V:
         assert img.width == ow and img.height == oh
 
         # to tensor
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
+        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1).to(self.param_dtype)
 
         F = frame_num
         seq_len = ((F - 1) // self.vae_stride[0] + 1) * (
@@ -611,6 +611,7 @@ class WanTI2V:
         if offload_model:
             del img, self.vae
             clear_cache()
+            logging.info("Remove VAE model.")
 
         @contextmanager
         def noop_no_sync():
@@ -667,6 +668,8 @@ class WanTI2V:
             latent = noise
             mask1, mask2 = masks_like([noise], zero=True)
             latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+            latent = latent.to(self.param_dtype)
+            latent = latent.to(self.device)
 
             arg_c = {
                 'context': [context[0]],
@@ -711,6 +714,7 @@ class WanTI2V:
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
                 latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
+                latent=latent.to(self.param_dtype)
 
                 x0 = [latent]
                 del (
@@ -729,17 +733,17 @@ class WanTI2V:
                 logging.info("Remove WanModel.")
                 clear_cache()
 
-            if self.rank == 0:
-                logging.info("Loading VAE model.")
-                self.vae = Wan2_2_VAE(
-                    vae_pth=os.path.join(
-                        self.checkpoint_dir, self.config.vae_checkpoint
-                    ),
-                    device=self.device,
-                    tile_size=self.vae_tile_size,
-                )
-                logging.info("Decoding video frames.")
-                videos = self.vae.decode(x0)
+        if self.rank == 0:
+            logging.info("Loading VAE model.")
+            self.vae = Wan2_2_VAE(
+                vae_pth=os.path.join(
+                    self.checkpoint_dir, self.config.vae_checkpoint
+                ),
+                device=self.device,
+                tile_size=self.vae_tile_size,
+            )
+            logging.info("Decoding video frames.")
+            videos = self.vae.decode(x0)
 
         if offload_model:
             del self.vae, x0
